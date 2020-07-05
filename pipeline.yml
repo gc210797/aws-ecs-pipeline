@@ -11,31 +11,67 @@ Parameters:
     Default: 2
   Subnets:
     Type: List<AWS::EC2::Subnet::Id>
+    Default: subnet-1d74d666,subnet-6c0c9420
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-97fcd3f6
   VpcId:
     Type: AWS::EC2::VPC::Id
+    Default: vpc-982924f0
   IsELBNeeded:
     Type: String
     AllowedValues:
       - Y
       - N
+    Default: Y
   LoadBalancerPort:
     Type: Number
+    Default: 8080
   HostPort:
     Type: Number
+    Default: 8080
   ContainerPort:
     Type: Number
+    Default: 8080
   HealthCheckPath:
     Type: String
+    Default: /ws
   ListenerRulePriority:
     Type: Number
+    Default: 1
   PathPattern:
     Type: String
+    Default: /ws
   ECSRole:
     Type: String
+    Default: RUST-CHAT
   TaskExecutionRole:
     Type: String
+    Default: RUST-CHAT-TASK
+  CodeBuildServiceRole:
+    Type: String
+    Default: RUST-CHAT-CB
+  GitHubUser:
+    Type: String
+    Default: gc210797
+  CodepipeArtifactLocation:
+    Type: String
+    Default: cf-templates-njdpta8paxbp-ap-south-1
+  GitHubToken:
+    Type: String
+    Default: 40cd26c91442ba48c4b73f46c2adc33685fba730
+  GitHubRepo:
+    Type: String
+    Default: aws-ecs-pipeline
+  GitHubBranch:
+    Type: String
+    Default: master
+  ECRRepositoryName:
+    Type: String
+    Default: rust-chat
+  HealthCheckGracePeriod:
+    Type: Number
+    Default: 600
 
 Conditions:
   ELBCondition: !Equals [ !Ref IsELBNeeded, Y ]
@@ -55,12 +91,13 @@ Resources:
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
       Port: !Ref LoadBalancerPort
-      Protocol: HTTP
+      Protocol: "HTTP"
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ELBCondition
     Properties:
       VpcId: !Ref VpcId
       Port: !Ref HostPort
@@ -69,6 +106,7 @@ Resources:
       HealthCheckIntervalSeconds: 30
       HealthCheckTimeoutSeconds: 5
       HealthyThresholdCount: 2
+      Protocol: HTTP
       TargetType: "instance"
       TargetGroupAttributes:
         - Key: deregistration_delay.timeout_seconds
@@ -83,10 +121,15 @@ Resources:
       Conditions:
         - Field: path-pattern
           Values:
-            - !Ref PathPatern
+            - !Ref PathPattern
       Actions:
         - TargetGroupArn: !Ref TargetGroup
           Type: forward
+  #ECR Repository
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ECRRepositoryName
   #ECS Cluster
   Cluster:
     Type: AWS::ECS::Cluster
@@ -95,16 +138,18 @@ Resources:
   LaunchConfiguration:
     Type: AWS::AutoScaling::LaunchConfiguration
     Properties:
-      ImageId: ami-ce1c36ab
+      ImageId: ami-0e26e067030ec6083
       InstanceType: !Ref InstanceType
-      IamInstanceProfile: !Sub arn:aws:iam:${AWS::Region}:${AWS::AccountId}:instance-profile/${ECSRole}
-      SecurityGroups: !Ref SecurityGroup
-    UserData:
-      "Fn::Base64": !Sub |
-          #!/bin/bash
-          yum install -y aws-cfn-bootstrap
-          /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
-          /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource AutoScalingGroup
+      IamInstanceProfile: !Ref ECSRole
+      SecurityGroups:
+        - !Ref SecurityGroup
+      UserData:
+        "Fn::Base64": !Sub |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
+            /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource AutoScalingGroup
     Metadata:
       AWS::CloudFormation::Init:
         config:
@@ -120,7 +165,7 @@ Resources:
                   [main]
                   stack=${AWS::StackId}
                   region=${AWS::Region}
-            "/etc/cfn/hook.d/cfn-auto-reloader.conf":
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
               mode: 000400
               owner: root
               group: root
@@ -145,40 +190,39 @@ Resources:
       MinSize: !Ref ClusterSize
       MaxSize: !Ref ClusterSize
       DesiredCapacity: !Ref ClusterSize
-      CreationPolicy:
-        ResourceSignal:
-          Timeout: PT15M
-      UpdatePolicy:
-        AutoScalingRollingUpdate:
-          MinInstanceInService: 1
-          MaxBatchSize: 1
-          PauseTime: PT15M
-          WaitOnResourceSignal: true
+      HealthCheckGracePeriod: !Ref HealthCheckGracePeriod
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstanceInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignal: true
       Tags:
         - Keys: Name
           Value: !Sub ${AWS::StackName}-EC2
           PropogateAtLaunch: true
   #ECS Service
-  TaskDefition:
-    Type: AWS::ECS::TaskDefition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Sub ${AWS::StackName}-td
-      RequiresCompatibilities: EC2
+      RequiresCompatibilities:
+        - EC2
       Memory: 512
       Cpu: 256
       NetworkMode: bridge
-      ExecutionRoleArn: !Ref TaskExecutionRole
+      ExecutionRoleArn: !Sub ${TaskExecutionRole}
       ContainerDefinitions:
-        - Name: ${AWS::StackName}-cd
-          Image: amazon/amazon-ecs-example
-          EntryPoint:
-            - /usr/sbin/apach2
-            - -D
-            - FOREGROUND
+        - Name: !Sub ${AWS::StackName}-cd
+          Image: httpd
           Essential: true
           Memory: 256
           PortMappings:
             - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref HostPort
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -191,37 +235,40 @@ Resources:
       LogGroupName: !Sub /aws/ecs/${AWS::StackName}
   ECSService:
     Type: AWS::ECS::Service
+    DependsOn: LoadBalancerListener
     Properties:
       Cluster: !Ref Cluster
-      DesiredCount: !Ref DesiredCount
-      TaskDefition: !Ref TaskDefition
+      DesiredCount: !Ref ClusterSize
+      TaskDefinition: !Ref TaskDefinition
       LaunchType: EC2
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriod
       LoadBalancers:
-        - ContainerName: !Sub ${AWS::StackName}-lb
+        - ContainerName: !Sub ${AWS::StackName}-cd
           ContainerPort: !Ref ContainerPort
           TargetGroupArn: !Ref TargetGroup 
   #Code Pipeline
   CodeBuildDocker:
     Type: AWS::CodeBuild::Project
-    Name: !Sub ${AWS::StackName}-docker
-    ServiceRole: !Ref CodeBuildServiceRole
-    VpcConfig:
-      VpcId: !Ref VPC
-      Subnets: !Ref Subnet
-      SecurityGroupIds: !Ref SecurityGroup
-    Environment:
-      ComputeType: BUILD_GENERAL1_SMALL
-      Image: aws/codebuild/docker:latest
-      PrivilegedMode: true
-      Type: LINUX_CONTAINER
-      EnvironmentVariables:
-        - Name: AWS_DEFAULT_REGION
-          Value: !Ref AWS::Region
-        - Name: REPOSITORY_URI
-          Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
-        - Name: APPNAME
-          Value: !Ref AWS::StackName
     Properties:
+      Name: !Sub ${AWS::StackName}-docker
+      ServiceRole: !Ref CodeBuildServiceRole
+      VpcConfig:
+        VpcId: !Ref VpcId
+        Subnets: !Ref Subnets
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:2.0
+        PrivilegedMode: true
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}
+          - Name: APPNAME
+            Value: !Sub ${AWS::StackName}-cd #Appname should be same as container name
       Artifacts:
         Type: CODEPIPELINE
       Source:
@@ -238,13 +285,50 @@ Resources:
               commands:
                 - docker build --tage "$IMAGE_URI" .
                 - docker push "$IMAGE_URI"
-                - echo "[{\"name\": \"$APPNAME\", \"imageUri\": $IMAGE_URI}]" > images.json
+                - echo "[{\"name\":\"$APPNAME\",\"imageUri\":\"$IMAGE_URI\"}]" > images.json
             artifacts:
               files: images.json
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource:
+                  - !Sub arn:aws:s3:::${CodepipeArtifactLocation}/*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
     Properties:
-      RoleArn: !Ref CodepipelineServiceRole
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
       ArtifactStore:
         Type: S3
         Location: !Ref CodepipeArtifactLocation
@@ -260,6 +344,7 @@ Resources:
               Configuration:
                 Owner: !Ref GitHubUser
                 Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
                 OAuthToken: !Ref GitHubToken
               OutputArtifacts:
                 - Name: Source
@@ -276,7 +361,6 @@ Resources:
                 ProjectName: !Ref CodeBuildDocker
               InputArtifacts:
                 - Name: Source
-                - Name: SourceBuild
               OutputArtifacts:
                 - Name: BuildOutput
               RunOrder: 1
@@ -287,10 +371,10 @@ Resources:
                 Category: Deploy
                 Owner: AWS
                 Version: 1
-                Provder: ECS
+                Provider: ECS
               Configuration:
                 ClusterName: !Ref Cluster
-                ServiceName: !Ref Service
+                ServiceName: !Ref ECSService
                 FileName: images.json
               InputArtifacts:
                 - Name: BuildOutput
